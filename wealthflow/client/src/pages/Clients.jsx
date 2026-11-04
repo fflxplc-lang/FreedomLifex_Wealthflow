@@ -40,6 +40,10 @@ export function UserModal({ initial, users, onClose, onSaved }) {
     if (initial?.id) await api.put(`/users/${initial.id}`, body); else await api.post('/users', body);
     onSaved(); onClose();
   }, recalculate ? 'Saved and payouts recalculated' : 'Saved');
+  // Other accounts on this email; an L1-L3 reporting to the L4+ BM on it is that BM's RM ID.
+  const em = String(f.email || '').trim().toLowerCase();
+  const sharedWith = em ? users.filter((u) => u.id !== initial?.id && (u.email || '').toLowerCase() === em) : [];
+  const rmOfBm = Number(f.level) <= 3 ? sharedWith.find((u) => u.level >= 4 && u.id === Number(f.parent_id)) : null;
   const toggleLevel = (l) => set('extra_levels', f.extra_levels.includes(l) ? f.extra_levels.filter((x) => x !== l) : [...f.extra_levels, l]);
   return (
     <Modal title={initial?.id ? 'Edit User' : 'Provision User'} onClose={onClose} footer={<>
@@ -50,7 +54,7 @@ export function UserModal({ initial, users, onClose, onSaved }) {
     </>}>
       <div className="form-section"><UserPlus size={15} />Basic Information</div>
       <Field label="Full Name"><input className="input" value={f.name} onChange={(e) => set('name', e.target.value)} placeholder="John Mathew" /></Field>
-      <Field label="Access Email"><input className="input" value={f.email} onChange={(e) => set('email', e.target.value)} placeholder="john@wealthflow.com" /></Field>
+      <Field label="Access Email" hint={sharedWith.length ? (rmOfBm ? `RM ID of ${rmOfBm.name}: shares their email and may use a different name. They choose the account at sign-in.` : `Already used by ${sharedWith.map((u) => u.name).join(', ')}. A different name is allowed only for an RM ID: Level L1-L3 reporting directly to the L4+ BM on this email.`) : ''}><input className="input" value={f.email} onChange={(e) => set('email', e.target.value)} placeholder="john@wealthflow.com" /></Field>
       <div className="grid g2">
         <Field label="Employee/ARN Code"><input className="input" value={f.code || ''} onChange={(e) => set('code', e.target.value)} placeholder="WF-001" /></Field>
         <Field label="GST Number (optional)"><input className="input" value={f.gst || ''} onChange={(e) => set('gst', e.target.value)} placeholder="22AAAAA0000A1Z5" /></Field>
@@ -126,17 +130,19 @@ const TEMPLATE = [
 ];
 
 // Second, RM-level account for BMs (L4+) who also handle clients themselves. Same details and password,
-// reports to the BM's own account and shares their email; the RM ID's code is CODE-RM.
+// reports to the BM's own account and shares their email; the RM ID's code is CODE-RM. The RM ID can
+// have its own name (blank = the BM's name).
 function RmIds({ users, onClose, onDone }) {
   const bms = users.filter((u) => u.level >= 4 && u.role !== 'admin').sort((a, b) => b.level - a.level || a.name.localeCompare(b.name));
   const has = (u) => users.some((x) => Number(x.parent_id) === u.id && x.level <= 3 && x.email.toLowerCase() === u.email.toLowerCase());
   const [pick, setPick] = useState(() => new Set(bms.filter((u) => !has(u)).map((u) => u.id)));
   const [level, setLevel] = useState(1);
+  const [names, setNames] = useState({});
   const [run, busy] = useAction();
   const toggle = (id) => setPick((p0) => { const p = new Set(p0); p.has(id) ? p.delete(id) : p.add(id); return p; });
   const create = () => run(async () => {
-    const r = await api.post('/users/rm-ids', { ids: [...pick], level });
-    exportExcel(r.created.map((m) => ({ Name: m.name, 'Login Email (same as BM)': m.email, 'RM Login Code': m.code || '', Password: 'Same as their BM login' })), 'rm-ids-created.xlsx');
+    const r = await api.post('/users/rm-ids', { ids: [...pick], level, names: Object.fromEntries([...pick].map((id) => [id, (names[id] || '').trim()]).filter(([, n]) => n)) });
+    exportExcel(r.created.map((m) => ({ 'RM ID Name': m.name, BM: m.bm, 'Login Email (same as BM)': m.email, 'RM Login Code': m.code || '', Password: 'Same as their BM login' })), 'rm-ids-created.xlsx');
     onDone(); onClose();
   }, 'RM IDs created');
   return (
@@ -144,7 +150,8 @@ function RmIds({ users, onClose, onDone }) {
       <button className="btn btn-ghost btn-caps" onClick={onClose}>Cancel</button>
       <button className="btn btn-primary btn-caps btn-lg" disabled={busy || !pick.size} onClick={create}>Create {pick.size} RM ID{pick.size === 1 ? '' : 's'}</button>
     </>}>
-      <div className="small muted">Each ticked BM gets a second account at the RM level below, with the same name, PAN, GSTIN, ARN/EUIN, bank, address and password.
+      <div className="small muted">Each ticked BM gets a second account at the RM level below, with the same PAN, GSTIN, ARN/EUIN, bank, address and password.
+        It takes the BM's name unless you type a different <b>RM ID name</b>.
         It reports to the BM's own account and uses <b>the same email</b>. Signing in with that email asks which account to open (BM or RM), and inside the app they can switch between the two from the top bar.
         Their code with <span className="mono">-RM</span> opens the RM account directly. A list of the new logins downloads when you create them.</div>
       <div className="row gap" style={{ alignItems: 'center' }}>
@@ -154,13 +161,14 @@ function RmIds({ users, onClose, onDone }) {
       <div className="table-wrap scroll" style={{ maxHeight: 380 }}>
         <table className="t compact">
           <thead><tr><th style={{ width: 30 }}><input type="checkbox" checked={pick.size > 0 && bms.filter((u) => !has(u)).every((u) => pick.has(u.id))} onChange={(e) => setPick(new Set(e.target.checked ? bms.filter((u) => !has(u)).map((u) => u.id) : []))} /></th>
-            <th>BM</th><th>Level</th><th>New RM login</th></tr></thead>
-          <tbody>{!bms.length && <tr><td colSpan={4}><Empty title="No L4+ BMs in the team" /></td></tr>}
+            <th>BM</th><th>Level</th><th>RM ID name</th><th>New RM login</th></tr></thead>
+          <tbody>{!bms.length && <tr><td colSpan={5}><Empty title="No L4+ BMs in the team" /></td></tr>}
             {bms.map((u) => (
               <tr key={u.id}>
                 <td><input type="checkbox" disabled={has(u)} checked={pick.has(u.id)} onChange={() => toggle(u.id)} /></td>
                 <td><div className="semi">{u.name}</div><div className="cell-sub">{u.email}</div></td>
                 <td>L{u.level}</td>
+                <td>{has(u) ? <span className="faint">—</span> : <input className="input" style={{ minWidth: 160 }} value={names[u.id] || ''} placeholder={u.name} disabled={!pick.has(u.id)} onChange={(e) => setNames((n) => ({ ...n, [u.id]: e.target.value }))} />}</td>
                 <td className="small">{has(u) ? <span className="faint">Already has an RM ID</span> : <><span className="mono">{u.email}</span>{u.code && <div className="cell-sub mono">or {u.code}-RM</div>}</>}</td>
               </tr>))}
           </tbody>
@@ -188,7 +196,7 @@ function ImportTeam({ onClose, onDone }) {
     </>}>
       <div className="small muted">One row per person. Required: <b>Full Name</b>, <b>Access Email</b> and <b>Level</b> (L1 to L7). <b>Role</b> is Ops / RM, Mentor, Partner or Admin (blank = Ops / RM).
         <b> Reports To</b> is the manager's email, code or name, either already in the team or in the same file. A blank <b>Password</b> gives <span className="mono">Welcome@123</span>.
-        A blank <b>Sharing %</b> follows the policy for the level. People whose email already has an account are skipped.</div>
+        A blank <b>Sharing %</b> follows the policy for the level. A row with the same email as a BM is that BM's <b>RM ID</b> (it may have a different name) when its Level is L1-L3 and Reports To is the BM.</div>
       <div className="row gap wrap">
         <button className="btn btn-soft btn-caps" onClick={() => exportExcel(TEMPLATE, 'team-import-template.xlsx')}><FileSpreadsheet size={14} />Download template</button>
         <label className="btn btn-primary btn-caps"><Upload size={14} />{file ? file.name : 'Choose filled file'}<input type="file" accept=".xlsx,.xls,.csv" hidden onChange={(e) => pick(e.target.files[0] || null)} /></label>
