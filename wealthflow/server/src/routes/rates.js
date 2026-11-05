@@ -1,70 +1,73 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { createRequire } from 'node:module';
 import { db, audit, tx } from '../db.js';
 import { requireAdmin } from '../auth.js';
-import { parseTable, cell } from '../parsers/registrar.js';
-import { clean, upper, num } from '../util.js';
+import { parseRateSheet, extractRatesFromText, pdfText } from '../parsers/rates.js';
+import { FUND_HOUSES, fundHouseOf } from '../parsers/registrar.js';
+import { clean, upper } from '../util.js';
 import { standardName } from '../services/mapping.js';
 
-const require = createRequire(import.meta.url);
-const pdfParse = require('pdf-parse/lib/pdf-parse.js');
 const r = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-// Pull "<scheme name> ... <rate>%" lines out of an AMC brokerage-structure PDF.
-export function extractRatesFromText(text) {
-  const out = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const line = clean(raw);
-    if (line.length < 8 || !/fund|plan|scheme|etf|fof|index|portfolio/i.test(line)) continue;
-    const m = line.match(/^(.*?[A-Za-z)].*?)\s+(\d{1,2}(?:\.\d{1,3})?)\s*%/) || line.match(/^(.*?[A-Za-z)])\s+(\d?\.\d{1,3})(?:\s|$)/);
-    if (!m) continue;
-    const rate = Number(m[2]);
-    if (!(rate > 0 && rate < 5)) continue;
-    const scheme = m[1].replace(/^\d+[.)]\s*/, '').replace(/[-–:|]+$/, '').trim();
-    if (scheme.length > 4) out.push({ scheme, rate });
-  }
-  return out;
-}
-
 function guessAmc(fileName, text) {
-  const base = fileName.replace(/\.[a-z]+$/i, '').replace(/[_-]+/g, ' ');
+  const base = fileName.replace(/\.[a-z0-9]+$/i, '').replace(/[_-]+/g, ' ');
+  const hay = upper(`${base} ${String(text).slice(0, 800)}`);
   const known = db.prepare("SELECT DISTINCT standard FROM name_map WHERE kind = 'amc'").all().map((x) => x.standard);
-  const hay = upper(`${base} ${text.slice(0, 600)}`);
-  const hit = known.filter((k) => k.length > 2 && hay.includes(k)).sort((a, b) => b.length - a.length)[0];
-  return hit || upper(base.split(' ')[0]);
+  const hit = known.filter((k) => k.length > 2 && new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(hay)).sort((a, b) => b.length - a.length)[0];
+  if (hit) return hit;
+  const house = FUND_HOUSES.find(([p]) => new RegExp(`\\b${p.trim()}\\b`).test(hay));
+  if (house) return house[1];
+  const first = upper(base.split(' ')[0]);
+  return /^(BROKERAGE|RATE|RATES|SHEET|STRUCTURE|AMC|COMMISSION|TRAIL|NEW|FINAL|COPY|FILE|MASTER|\d.*)$/.test(first) ? '' : first;
 }
 
+// Reads one uploaded file: { rows: [{amc, scheme, rate}], notes: [] }.
+async function readRateFile(f, amcOverride) {
+  if (/\.pdf$/i.test(f.originalname)) {
+    const text = await pdfText(f.buffer);
+    if (clean(text).length < 40) throw new Error('This PDF has no readable text (it is a scanned image). Upload the Excel version or a text PDF.');
+    const amc = amcOverride || guessAmc(f.originalname, text);
+    const rows = extractRatesFromText(text).map((x) => ({ ...x, amc: amcOverride || fundHouseOf(x.scheme) || amc }));
+    return { rows, notes: rows.length ? [`${rows.length} scheme(s) read from the PDF text`] : ['No "scheme name … rate" lines found in this PDF. If it is a table, upload the Excel version.'] };
+  }
+  if (!/\.(xlsx|xlsm|xls|csv|txt|ods)$/i.test(f.originalname)) throw new Error('Unsupported file type. Use PDF, Excel (.xlsx / .xls) or CSV.');
+  const got = parseRateSheet(f.buffer, f.originalname, guessAmc);
+  if (amcOverride) for (const x of got.rows) x.amc = amcOverride;
+  return got;
+}
+
+// Upload AMC brokerage files (PDF / Excel / CSV, any layout). Each file is read on its own, so one bad
+// file doesn't stop the others. A scheme already in the master for the same month is updated, not duplicated.
 r.post('/upload', requireAdmin, upload.array('files', 20), async (req, res, next) => {
   try {
-    const period = req.body.period || new Date().toISOString().slice(0, 7);
+    if (!req.files?.length) throw new Error('Choose at least one file');
+    const period = /^\d{4}-\d{2}$/.test(req.body.period || '') ? req.body.period : new Date().toISOString().slice(0, 7);
+    const amcOverride = clean(req.body.amc);
+    const find = db.prepare('SELECT id FROM rates WHERE amc = ? AND lower(scheme) = lower(?) AND period = ? ORDER BY id DESC LIMIT 1');
+    const upd = db.prepare('UPDATE rates SET rate = ?, scheme = ?, source = ? WHERE id = ?');
+    const ins = db.prepare('INSERT INTO rates(amc, scheme, period, rate, source) VALUES(?, ?, ?, ?, ?)');
     let total = 0;
-    const perFile = [];
-    for (const f of req.files || []) {
-      let rows = [];
-      let amc = req.body.amc || '';
-      if (/\.pdf$/i.test(f.originalname)) {
-        const { text } = await pdfParse(f.buffer);
-        amc = amc || guessAmc(f.originalname, text);
-        rows = extractRatesFromText(text).map((x) => ({ ...x, amc }));
-      } else {
-        const t = parseTable(f.buffer, f.originalname);
-        rows = t.data.map((row) => ({
-          amc: clean(cell(row, t.cols, 'amc')) || amc || guessAmc(f.originalname, ''),
-          scheme: clean(cell(row, t.cols, 'scheme')),
-          rate: num(cell(row, t.cols, 'rate')),
-        })).filter((x) => x.scheme && x.rate > 0);
+    const files = [];
+    for (const f of req.files) {
+      try {
+        const { rows, notes } = await readRateFile(f, amcOverride);
+        let added = 0, updated = 0;
+        tx(() => {
+          for (const x of rows) {
+            const amc = standardName('amc', x.amc || 'UNKNOWN');
+            const hit = find.get(amc, x.scheme, period);
+            if (hit) { upd.run(x.rate, x.scheme, f.originalname, hit.id); updated++; } else { ins.run(amc, x.scheme, period, x.rate, f.originalname); added++; }
+          }
+        });
+        total += rows.length;
+        files.push({ file: f.originalname, schemes: rows.length, added, updated, notes, sample: rows.slice(0, 5), amcs: [...new Set(rows.map((x) => x.amc))].slice(0, 5) });
+      } catch (e) {
+        files.push({ file: f.originalname, schemes: 0, error: e.message });
       }
-      tx(() => {
-        const ins = db.prepare('INSERT INTO rates(amc, scheme, period, rate, source) VALUES(?, ?, ?, ?, ?)');
-        for (const x of rows) ins.run(standardName('amc', x.amc), x.scheme, period, x.rate, f.originalname);
-      });
-      total += rows.length;
-      perFile.push({ file: f.originalname, schemes: rows.length });
     }
-    audit(req.user, 'RATES_UPLOAD', `${total} scheme rate(s) extracted from ${perFile.length} file(s) for ${period}`);
-    res.json({ total, files: perFile });
+    audit(req.user, 'RATES_UPLOAD', `${total} scheme rate(s) read from ${files.length} file(s) for ${period}: ${files.map((x) => `${x.file} (${x.error ? 'failed' : x.schemes})`).join(', ')}`);
+    res.json({ total, period, files });
   } catch (e) { next(e); }
 });
 

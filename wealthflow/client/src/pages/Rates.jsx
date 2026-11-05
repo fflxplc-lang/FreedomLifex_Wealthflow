@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { Upload, Download, Trash2, Search, Pencil, History } from 'lucide-react';
+import { Upload, Download, Trash2, Search, Pencil, History, X, CheckCircle2, AlertTriangle, FileText } from 'lucide-react';
 import { api, qs } from '../api.js';
 import { Card, PageHead, useLoad, useAction, Spinner, Empty, Modal, Field, Confirm, exportExcel, MONTHS } from '../ui.jsx';
 
@@ -11,17 +11,38 @@ export default function Rates() {
   const [confirm, setConfirm] = useState(null);
   const [period, setPeriod] = useState(new Date().toISOString().slice(0, 7));
   const [run, busy] = useAction();
+  const [files, setFiles] = useState([]);
+  const [amc, setAmc] = useState('');
+  const [drag, setDrag] = useState(false);
+  const [result, setResult] = useState(null);
   const file = useRef();
   const { data, reload } = useLoad(() => api.get(`/rates${qs(f)}`), [JSON.stringify(f)]);
 
-  const upload = (files) => run(async () => {
+  // Step 1: pick files (button or drag & drop). Step 2: "Process files now" uploads and reads them.
+  const OK_FILE = /\.(pdf|xlsx|xlsm|xls|csv|txt|ods)$/i;
+  const addFiles = (list) => {
+    const picked = [...list].filter((x) => OK_FILE.test(x.name));
+    setResult(null);
+    setFiles((cur) => [...cur, ...picked.filter((x) => !cur.some((c) => c.name === x.name && c.size === x.size))].slice(0, 20));
+  };
+  const processFiles = () => run(async () => {
     const fd = new FormData();
     for (const x of files) fd.append('files', x);
     fd.append('period', period);
-    const r = await api.post('/rates/upload', fd);
-    reload();
-    return r;
-  }, (r) => `${r.total} scheme rate(s) extracted from ${r.files.length} file(s)`);
+    if (amc.trim()) fd.append('amc', amc.trim());
+    try {
+      const r = await api.post('/rates/upload', fd);
+      setResult(r);
+      if (r.files.every((x) => !x.error)) setFiles([]);
+      else setFiles((cur) => cur.filter((x) => r.files.some((y) => y.error && y.file === x.name)));
+      reload();
+      return r;
+    } catch (e) {
+      if (/413/.test(e.message)) throw new Error('The file is too large for the web server. Ask your admin to raise client_max_body_size in Nginx (e.g. 50M).');
+      throw e;
+    }
+  }, (r) => (r.total ? `${r.total} scheme rate(s) saved from ${r.files.filter((x) => !x.error).length} file(s)` : 'No rates found. See the details under the upload box.'));
+  const kb = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
   const years = [...new Set((data?.rows || []).map((r) => r.period?.slice(0, 4)))].filter(Boolean);
 
   return (
@@ -32,16 +53,52 @@ export default function Rates() {
       </PageHead>
       <div className="grid g-1-2">
         <div className="col gap-lg">
-          <div className="dropzone" style={{ padding: 34 }} onClick={() => file.current.click()}>
-            <Upload size={34} className="t-blue" />
-            <div className="card-title" style={{ color: 'var(--text)' }}>Upload Brokerage PDF</div>
-            <div className="tiny upper bold">Auto-extract rates from AMC PDFs (or .xlsx / .csv rate sheets)</div>
-            <div className="row gap-sm" onClick={(e) => e.stopPropagation()}>
-              <span className="tiny bold upper">Effective</span><input type="month" className="input sm" value={period} onChange={(e) => setPeriod(e.target.value)} />
+          <Card className="card-pad col gap">
+            <div className={`dropzone ${drag ? 'drag' : ''}`} style={{ padding: 30, border: 'none' }} onClick={() => !busy && file.current.click()}
+              onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
+              onDrop={(e) => { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer.files); }}>
+              <Upload size={34} className="t-blue" />
+              <div className="card-title" style={{ color: 'var(--text)' }}>Upload AMC Brokerage File</div>
+              <div className="tiny upper bold">PDF, Excel or CSV — any layout, any file name</div>
+              <button type="button" className="btn btn-primary btn-caps btn-lg" disabled={busy}>
+                {files.length ? `Selected ${files.length} file${files.length === 1 ? '' : 's'}` : 'Select Files'}
+              </button>
+              <button type="button" className="btn btn-ghost btn-caps btn-xs" style={{ color: 'var(--blue)' }} disabled={!files.length || busy}
+                onClick={(e) => { e.stopPropagation(); processFiles(); }}>{busy ? 'Processing…' : 'Process files now'}</button>
+              <input ref={file} type="file" hidden multiple accept=".pdf,.xlsx,.xlsm,.xls,.csv,.txt,.ods" onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }} />
             </div>
-            <button className="btn btn-primary btn-caps btn-lg" disabled={busy}>{busy ? 'Extracting…' : 'Select PDF Files'}</button>
-            <input ref={file} type="file" hidden multiple accept=".pdf,.xlsx,.xls,.csv" onChange={(e) => { const fl = [...e.target.files]; e.target.value = ''; if (fl.length) upload(fl); }} />
-          </div>
+            {files.length > 0 && (
+              <div className="col gap-sm">
+                {files.map((x) => (
+                  <div key={x.name + x.size} className="row gap-sm small" style={{ alignItems: 'center' }}>
+                    <FileText size={14} className="faint" /><span className="grow semi" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{x.name}</span>
+                    <span className="tiny faint">{kb(x.size)}</span>
+                    <button className="icon-btn" title="Remove" disabled={busy} onClick={() => setFiles(files.filter((y) => y !== x))}><X size={13} /></button>
+                  </div>
+                ))}
+                <div className="grid g2" style={{ gap: 8 }}>
+                  <Field label="Effective month"><input type="month" className="input sm" value={period} onChange={(e) => setPeriod(e.target.value)} /></Field>
+                  <Field label="AMC (optional)" hint="Leave blank to detect it from the file"><input className="input sm" value={amc} placeholder="e.g. SBI" onChange={(e) => setAmc(e.target.value)} /></Field>
+                </div>
+              </div>
+            )}
+            {result && (
+              <div className="col gap-sm">
+                {result.files.map((x) => (
+                  <div key={x.file} className={`banner ${x.error || !x.schemes ? 'amber' : 'green'}`} style={{ display: 'block' }}>
+                    <div className="row gap-sm semi small" style={{ alignItems: 'center' }}>
+                      {x.error || !x.schemes ? <AlertTriangle size={14} className="t-amber" /> : <CheckCircle2 size={14} className="t-green" />}
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{x.file}</span>
+                    </div>
+                    <div className="tiny" style={{ marginTop: 4 }}>
+                      {x.error || (x.schemes ? `${x.schemes} scheme rate(s): ${x.added} new, ${x.updated} updated${x.amcs?.length ? ` · ${x.amcs.join(', ')}` : ''}` : '')}
+                    </div>
+                    {!x.error && x.notes?.map((n) => <div key={n} className="tiny muted">{n}</div>)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
           <Card className="card-pad col gap">
             <div className="card-title">Structure Analytics</div>
             <div className="kv"><span className="upper faint" style={{ fontSize: 9.5 }}>Total Schemes</span><b style={{ fontSize: 18 }}>{data?.stats.schemes ?? 0}</b></div>

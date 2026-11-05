@@ -85,7 +85,7 @@ const get = (row, cols, f) => (f in cols ? row[cols[f]] : '');
 
 // KFintech's "Fund" column is a code (e.g. 127), so when the scheme name starts with a known
 // fund house, use that name; names match what AMC codes standardize to.
-const FUND_HOUSES = [
+export const FUND_HOUSES = [
   ['ADITYA BIRLA', 'ADITYA BIRLA SUN LIFE'], ['ABSL', 'ADITYA BIRLA SUN LIFE'], ['AXIS', 'AXIS'], ['BANDHAN', 'BANDHAN'],
   ['BANK OF INDIA', 'BANK OF INDIA'], ['BARODA BNP', 'BARODA BNP PARIBAS'], ['BAJAJ FINSERV', 'BAJAJ FINSERV'],
   ['CANARA ROBECO', 'CANARA ROBECO'], ['DSP', 'DSP'], ['EDELWEISS', 'EDELWEISS'], ['FRANKLIN', 'FRANKLIN TEMPLETON'],
@@ -97,6 +97,12 @@ const FUND_HOUSES = [
   ['TAURUS', 'TAURUS'], ['TRUST', 'TRUST'], ['UNION', 'UNION'], ['UTI', 'UTI'], ['WHITEOAK', 'WHITEOAK CAPITAL'],
   ['360 ONE', '360 ONE'], ['GROWW', 'GROWW'], ['ZERODHA', 'ZERODHA'],
 ];
+// Fund house a scheme name starts with ("SBI Long Term Fund" -> SBI), or ''.
+export function fundHouseOf(scheme) {
+  const u = upper(scheme);
+  const hit = u && FUND_HOUSES.find(([p]) => u.startsWith(p));
+  return hit ? hit[1] : '';
+}
 function amcOf(row, cols) {
   const scheme = upper(get(row, cols, 'scheme'));
   const hit = scheme && FUND_HOUSES.find(([p]) => scheme.startsWith(p));
