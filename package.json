@@ -1,0 +1,18 @@
+{
+  "name": "wealthflow",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Freedom LifeX Wealthflow \u2014 mutual fund brokerage, client mapping and payout management (React + Node.js + Express)",
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "dev": "node scripts/dev.mjs",
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start",
+    "samples": "npm --prefix server run samples",
+    "seed:demo": "npm --prefix server run seed:demo",
+    "testpack": "npm --prefix server run testpack"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
