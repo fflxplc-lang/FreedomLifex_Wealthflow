@@ -5,7 +5,7 @@
 import XLSX from 'xlsx';
 import { createRequire } from 'node:module';
 import { clean } from '../util.js';
-import { fundHouseOf } from './registrar.js';
+import { fundHouseOf, FUND_HOUSES } from './registrar.js';
 
 const SCHEME_WORD = /fund|plan|scheme|etf|fof|index|portfolio|series|fmp|interval|savings|bond|gilt|liquid|overnight|arbitrage|hybrid|cap\b|elss|tax saver/i;
 const MAX_RATE = 10;
@@ -156,7 +156,19 @@ export function parseRateSheet(buffer, fileName, guessAmc) {
 // and puts a wrapped cell on several lines, so name lines are collected until a line with a rate arrives.
 // The first rate on a line is used (first-year trail in most AMC tables).
 const PDF_RATE = /^(.*?)(\d{1,2}(?:\.\d{1,4})?)\s*(%|bps\b)/i;
-const PDF_BARE = /^(.*?[A-Za-z)\]])\s*(\d?\.\d{1,2})(?=\D|$|\d\.)/;
+const PDF_BARE = /^(.*?[A-Za-z)\]])\s*(\d?\.(?:\d{1,4}(?=[^\d.]|$)|\d{1,2}(?=\d\.)))/;
+// "ELSS Invesco India ELSS Tax Saver Fund (w.e.f. 9th Oct 26)" -> "Invesco India ELSS Tax Saver Fund".
+function tidyName(name) {
+  let n = name.replace(/\(\s*w\.?\s*e\.?\s*f\.?[^)]*\)/gi, '').replace(/[^\x20-\x7E\u2013\u2014&]/g, ' ').replace(/\s+/g, ' ').replace(/[\s\-–,:|]+$/, '').trim();
+  const u = n.toUpperCase();
+  let at = -1;
+  for (const [p] of FUND_HOUSES) {
+    const i = u.search(new RegExp(`(^|\\s)${p.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`));
+    if (i > 0 && (at < 0 || i < at)) at = i;
+  }
+  if (at > 0 && !fundHouseOf(n)) n = n.slice(at).trim();
+  return n;
+}
 const stripSerial = (s) => s.replace(/^\s*\d{1,3}[.)]?\s*(?=[A-Za-z])/, '').replace(/[-–:|,\s]+$/, '').trim();
 export function extractRatesFromText(raw) {
   const out = [];
@@ -169,7 +181,9 @@ export function extractRatesFromText(raw) {
       if (/^\d{1,3}[.)]?$/.test(line)) continue; // a serial number on its own line
       // The end of the previous scheme's name, wrapped below its rate ("Axis Banking & PSU Debt Fund - Regular" / "Plan").
       if (last && line.length < 40 && line.split(' ').length <= 4 && !/\d/.test(line) && !fundHouseOf(line)
-        && !/(schemes|funds|category|segment|structure|note|trail|rate|name)\b/i.test(line)) {
+        && !/(schemes|funds|category|segment|structure|note|trail|rate|name|terms|conditions)\b/i.test(line)
+        && !(line === line.toUpperCase() && last.scheme !== last.scheme.toUpperCase()) // a category label beside the table
+        && !line.split(' ').every((w) => CATEGORY_WORDS.has(w.toUpperCase().replace(/[()]/g, '')))) {
         seen.delete(last.scheme.toLowerCase());
         last.scheme = `${last.scheme} ${line}`.replace(/\s+-\s*$/, '');
         seen.add(last.scheme.toLowerCase());
@@ -189,6 +203,7 @@ export function extractRatesFromText(raw) {
     else if (lead && (!SCHEME_WORD.test(name) || /^[a-z&(-]/.test(name)) && SCHEME_WORD.test(`${lead} ${name}`)) name = `${lead} ${name}`;
     buf = [];
     last = null;
+    name = tidyName(name);
     if (!(rate > 0 && rate <= 5) || name.length < 6 || !SCHEME_WORD.test(name)) continue;
     const k = name.toLowerCase();
     if (seen.has(k)) continue;
@@ -199,14 +214,76 @@ export function extractRatesFromText(raw) {
   return out;
 }
 
+// The "Brokerage Structure" PDF that CAMS / KFintech generate for each AMC: per scheme a "Lump sum" and a
+// "Systematic" row ("Lump sum 1 to MAX 0 0.40 0.40 0.40 0.40 0.40": amount range, B30, incentive, then the
+// 1st-5th year trail), with the category and scheme name printed between them. The 1st year trail is used.
+// Returns null when the text isn't in this layout.
+const STRUCT_ROW = /^(.*?)\b(lump\s*sum|systematic|sip|stp)\b\s+(?:[\d,]+|max)\s+to\s+(?:[\d,]+|max)\s+((?:-?\d*\.?\d+\s*)+)/i;
+const CATEGORY_WORDS = new Set(('EQUITY DEBT HYBRID CASH INDEX FUND FUNDS ARBITRAGE FOF NFO SECTORAL THEMATIC SECTORAL/THEMATIC SOLUTION BASED '
+  + 'CORE BOND ELSS GOLD OVERNIGHT LIQUID INTERNATIONAL GILT ORIENTED OTHER OTHERS PASSIVE ACTIVE ETF ETFS SCHEMES SCHEME '
+  + 'NORMAL SPECIAL - 1 2 3 4 5 6 (G) G INCOME CREDIT MONEY MARKET DURATION SIF').split(' '));
+const DATE_RANGE = /\d{1,2}[-/ ][A-Za-z]{3}[-/ ]\d{2,4}\s*to\s*\d{1,2}[-/ ][A-Za-z]{3}[-/ ]\d{2,4}/gi;
+const BOILERPLATE = /brokerage structure|distributor\s*:|transaction|class scheme|nature amount|b30|generation date|perc-|apprdrt|terms\s*&|^•|investment period|page \d/i;
+
+function structName(raw) {
+  let n = clean(raw.replace(DATE_RANGE, ' ').replace(/\b(NORMAL|SPECIAL)\s*$/i, ''));
+  if (!n || BOILERPLATE.test(n)) return '';
+  n = tidyName(n);
+  if (!fundHouseOf(n)) {
+    // No fund house in the name (e.g. an SIF "HYBRID PRISM HYBRID LONG-SHORT FUND"): drop leading category words.
+    const words = n.split(' ');
+    const cat = (w) => CATEGORY_WORDS.has(w.toUpperCase().replace(/\([^)]*\)/g, '').replace(/[()]/g, '')) || CATEGORY_WORDS.has(w.toUpperCase());
+    while (words.length && cat(words[0])) words.shift();
+    n = words.join(' ');
+    if (!n || n.split(' ').every(cat) || !SCHEME_WORD.test(n)) return '';
+  }
+  return n.length >= 6 && /[A-Za-z]{3}/.test(n) ? n : '';
+}
+
+export function extractStructureRates(raw) {
+  const lines = String(raw).split(/\r?\n/).map(clean).filter(Boolean);
+  if (lines.filter((l) => STRUCT_ROW.test(l)).length < 2) return null;
+  const out = []; const seen = new Set();
+  let pendingRate = null, pendingName = null;
+  const save = (name, rate) => {
+    const k = name.toLowerCase();
+    if (seen.has(k) || !(rate > 0 && rate <= MAX_RATE)) return;
+    seen.add(k); out.push({ scheme: name, rate });
+  };
+  for (const line of lines) {
+    const m = line.match(STRUCT_ROW);
+    const nameText = m ? m[1] : line;
+    const name = structName(nameText);
+    if (name) {
+      if (pendingRate !== null) { save(name, pendingRate); pendingRate = null; pendingName = null; } else pendingName = name;
+    }
+    if (!m) continue;
+    const nums = m[3].trim().split(/\s+/).map(Number).filter((n) => Number.isFinite(n));
+    const rate = nums.length >= 5 ? nums[nums.length - 5] : nums[nums.length - 1];
+    if (/lump/i.test(m[2])) {
+      if (pendingName) { save(pendingName, rate); pendingName = null; pendingRate = null; } else pendingRate = rate;
+    } else if (pendingName) { save(pendingName, rate); pendingName = null; }
+  }
+  return out;
+}
+
 // Text of a PDF, one line per row of the page. pdf.js gives each piece of text with its position, so
 // pieces at the same height are joined left to right with spaces (table cells stay apart). Falls back
 // to pdf-parse if pdf.js can't open the file.
 const require = createRequire(import.meta.url);
-export async function pdfText(buffer) {
+export async function pdfText(buffer, password = '') {
   try {
     const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-    const doc = await pdfjs.getDocument({ data: new Uint8Array(buffer), isEvalSupported: false, verbosity: 0 }).promise;
+    let doc;
+    try {
+      doc = await pdfjs.getDocument({ data: new Uint8Array(buffer), isEvalSupported: false, verbosity: 0, ...(password ? { password } : {}) }).promise;
+    } catch (e) {
+      if (e?.name === 'PasswordException') {
+        throw Object.assign(new Error(password ? 'The PDF password is wrong. Check it and process the file again.'
+          : 'This PDF is password-protected. Type its password in the "PDF password" box and process it again.'), { password: true });
+      }
+      throw e;
+    }
     const lines = [];
     for (let n = 1; n <= doc.numPages; n++) {
       const page = await doc.getPage(n);
@@ -230,6 +307,7 @@ export async function pdfText(buffer) {
     await doc.destroy();
     return lines.join('\n');
   } catch (e) {
+    if (e.password) throw e;
     const pdfParse = require('pdf-parse/lib/pdf-parse.js');
     try { return (await pdfParse(buffer)).text; } catch { throw new Error(`This PDF could not be opened (${/password/i.test(e.message) ? 'it is password-protected' : 'it may be damaged'}). Save it again or upload the Excel version.`); }
   }

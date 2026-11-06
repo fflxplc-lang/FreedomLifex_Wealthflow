@@ -2,7 +2,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import { db, audit, tx } from '../db.js';
 import { requireAdmin } from '../auth.js';
-import { parseRateSheet, extractRatesFromText, pdfText } from '../parsers/rates.js';
+import { parseRateSheet, extractRatesFromText, extractStructureRates, pdfText } from '../parsers/rates.js';
 import { FUND_HOUSES, fundHouseOf } from '../parsers/registrar.js';
 import { clean, upper } from '../util.js';
 import { standardName } from '../services/mapping.js';
@@ -23,13 +23,17 @@ function guessAmc(fileName, text) {
 }
 
 // Reads one uploaded file: { rows: [{amc, scheme, rate}], notes: [] }.
-async function readRateFile(f, amcOverride) {
+async function readRateFile(f, amcOverride, password) {
   if (/\.pdf$/i.test(f.originalname)) {
-    const text = await pdfText(f.buffer);
+    const text = await pdfText(f.buffer, password);
     if (clean(text).length < 40) throw new Error('This PDF has no readable text (it is a scanned image). Upload the Excel version or a text PDF.');
     const amc = amcOverride || guessAmc(f.originalname, text);
-    const rows = extractRatesFromText(text).map((x) => ({ ...x, amc: amcOverride || fundHouseOf(x.scheme) || amc }));
-    return { rows, notes: rows.length ? [`${rows.length} scheme(s) read from the PDF text`] : ['No "scheme name … rate" lines found in this PDF. If it is a table, upload the Excel version.'] };
+    // The registrar "Brokerage Structure" layout (Lump sum / Systematic rows) first, then plain "scheme … rate" lines.
+    const structure = extractStructureRates(text);
+    const found = structure?.length ? structure : extractRatesFromText(text);
+    const rows = found.map((x) => ({ ...x, amc: amcOverride || fundHouseOf(x.scheme) || amc }));
+    const how = structure?.length ? 'brokerage structure layout, 1st year trail' : 'scheme and rate lines';
+    return { rows, notes: rows.length ? [`${rows.length} scheme(s) read from the PDF (${how})`] : ['No "scheme name … rate" lines found in this PDF. If it is a table, upload the Excel version.'] };
   }
   if (!/\.(xlsx|xlsm|xls|csv|txt|ods)$/i.test(f.originalname)) throw new Error('Unsupported file type. Use PDF, Excel (.xlsx / .xls) or CSV.');
   const got = parseRateSheet(f.buffer, f.originalname, guessAmc);
@@ -44,6 +48,7 @@ r.post('/upload', requireAdmin, upload.array('files', 20), async (req, res, next
     if (!req.files?.length) throw new Error('Choose at least one file');
     const period = /^\d{4}-\d{2}$/.test(req.body.period || '') ? req.body.period : new Date().toISOString().slice(0, 7);
     const amcOverride = clean(req.body.amc);
+    const password = String(req.body.password || '');
     const find = db.prepare('SELECT id FROM rates WHERE amc = ? AND lower(scheme) = lower(?) AND period = ? ORDER BY id DESC LIMIT 1');
     const upd = db.prepare('UPDATE rates SET rate = ?, scheme = ?, source = ? WHERE id = ?');
     const ins = db.prepare('INSERT INTO rates(amc, scheme, period, rate, source) VALUES(?, ?, ?, ?, ?)');
@@ -51,7 +56,7 @@ r.post('/upload', requireAdmin, upload.array('files', 20), async (req, res, next
     const files = [];
     for (const f of req.files) {
       try {
-        const { rows, notes } = await readRateFile(f, amcOverride);
+        const { rows, notes } = await readRateFile(f, amcOverride, password);
         let added = 0, updated = 0;
         tx(() => {
           for (const x of rows) {
@@ -63,7 +68,7 @@ r.post('/upload', requireAdmin, upload.array('files', 20), async (req, res, next
         total += rows.length;
         files.push({ file: f.originalname, schemes: rows.length, added, updated, notes, sample: rows.slice(0, 5), amcs: [...new Set(rows.map((x) => x.amc))].slice(0, 5) });
       } catch (e) {
-        files.push({ file: f.originalname, schemes: 0, error: e.message });
+        files.push({ file: f.originalname, schemes: 0, error: e.message, password: Boolean(e.password) });
       }
     }
     audit(req.user, 'RATES_UPLOAD', `${total} scheme rate(s) read from ${files.length} file(s) for ${period}: ${files.map((x) => `${x.file} (${x.error ? 'failed' : x.schemes})`).join(', ')}`);

@@ -13,6 +13,7 @@ export default function Rates() {
   const [run, busy] = useAction();
   const [files, setFiles] = useState([]);
   const [amc, setAmc] = useState('');
+  const [password, setPassword] = useState('');
   const [drag, setDrag] = useState(false);
   const [result, setResult] = useState(null);
   const file = useRef();
@@ -30,6 +31,7 @@ export default function Rates() {
     for (const x of files) fd.append('files', x);
     fd.append('period', period);
     if (amc.trim()) fd.append('amc', amc.trim());
+    if (password) fd.append('password', password);
     try {
       const r = await api.post('/rates/upload', fd);
       setResult(r);
@@ -80,6 +82,11 @@ export default function Rates() {
                   <Field label="Effective month"><input type="month" className="input sm" value={period} onChange={(e) => setPeriod(e.target.value)} /></Field>
                   <Field label="AMC (optional)" hint="Leave blank to detect it from the file"><input className="input sm" value={amc} placeholder="e.g. SBI" onChange={(e) => setAmc(e.target.value)} /></Field>
                 </div>
+                {files.some((x) => /\.pdf$/i.test(x.name)) && (
+                  <Field label="PDF password (only if the PDF asks for one)" hint="Used for every selected PDF. Upload PDFs with different passwords one at a time.">
+                    <input className="input sm" type="password" autoComplete="off" value={password} placeholder="Leave blank if the PDF opens without a password" onChange={(e) => setPassword(e.target.value)} />
+                  </Field>
+                )}
               </div>
             )}
             {result && (
